@@ -1,10 +1,11 @@
-import { createAgent, ReactAgent, toolStrategy } from "langchain";
+import { createAgent, initChatModel, ReactAgent, toolStrategy } from "langchain";
 import { BrowserInstance } from "./browser";
 import { createNavigatorTools } from "./browserContext";
 import { Logger } from "@nestjs/common";
 import * as z from "zod";
 import { Browser, Page } from "puppeteer";
 import { Agent } from "src/core/interfaces/agent";
+import { AzureChatOpenAI, AzureOpenAI } from "@langchain/openai";
 
 const navigationResponseSchema = z.object({
     action: z.string().describe("The action executed by the agent."),
@@ -62,8 +63,15 @@ export class AgentNavigator implements Agent{
             logger: new Logger('NavigatorAgent'),
         });
 
+        const model = new AzureChatOpenAI({
+            azureOpenAIApiKey: process.env.AZURE_OPENAI_API_KEY,
+            azureOpenAIEndpoint: process.env.AZURE_OPENAI_ENDPOINT,
+            azureOpenAIApiDeploymentName: process.env.AZURE_OPENAI_DEPLOYMENT_NAME,
+            azureOpenAIApiVersion: process.env.AZURE_OPENAI_API_VERSION,
+        });
+
         this.agent = createAgent({
-            model: process.env.MODEL || "gpt-4o",
+            model,
             systemPrompt: `You are a navigation agent that helps users navigate the web.
 
             IMPORTANT RULES:
@@ -72,7 +80,7 @@ export class AgentNavigator implements Agent{
             - Each action in page elements you should call 'get_page_content' tool to get the current state of the page and identify elements available to interact with.
             - Respond immediately after completing the requested action.`,
             tools: Object.values(tools),
-            responseFormat: toolStrategy(navigationResponseSchema),
+
         });
     }
 
