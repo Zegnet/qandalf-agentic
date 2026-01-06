@@ -21,6 +21,10 @@ export class AgentNavigator implements Agent{
     private agent: ReactAgent | undefined;
     private browserInstance: {browser: Browser; page: Page } | undefined;
 
+    constructor(
+        @Inject('MODEL_FACTORY') private readonly modelFactory: ModelFactory,
+    ) {}
+
     async invoke(input: { messages: { role: string; content: string; }[]; }): Promise<{ structuredResponse?: any; }> {
         if (!this.agent) {
             throw new Error("Agent not initialized");
@@ -59,24 +63,7 @@ export class AgentNavigator implements Agent{
             logger: new Logger('NavigatorAgent'),
         });
 
-        let model;
-
-        if(!process.env.AZURE_OPENAI_API_KEY) {
-
-            model = new ChatOpenAI({
-                model: process.env.OPENAI_MODEL || 'gpt-4-turbo',
-            });
-
-        }else{
-
-            model = new AzureChatOpenAI({
-                azureOpenAIApiKey: process.env.AZURE_OPENAI_API_KEY,
-                azureOpenAIEndpoint: process.env.AZURE_OPENAI_ENDPOINT,
-                azureOpenAIApiDeploymentName: process.env.AZURE_OPENAI_DEPLOYMENT_NAME,
-                azureOpenAIApiVersion: process.env.AZURE_OPENAI_API_VERSION,
-            });
-        }
-
+        const model = this.modelFactory.getModel();
 
         this.agent = createAgent({
             model,
