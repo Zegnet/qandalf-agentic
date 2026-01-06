@@ -16,7 +16,7 @@ export class AppService {
     const steps = task.split(';');
     this.logger.log(`Executing task for session ${uuid}: ${steps.join('\n')}`);
     for(const step of steps) {
-      
+      this.logger.log(`[STEP]: ${step}\n`);
       const session = this.sseService.getSession(uuid);
 
       if (!session) {

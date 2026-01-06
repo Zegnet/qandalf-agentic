@@ -32,21 +32,118 @@ export function createNavigatorTools(context: BrowserContext) {
         }
     );
 
+    // Helper function to find element in both regular DOM and Shadow DOM
+    async function findElementWithShadowDom(selector: string): Promise<boolean> {
+        return await context.page.evaluate((sel) => {
+            // Try regular querySelector first
+            let element = document.querySelector(sel);
+            if (element) return true;
+
+            // If not found, search in shadow DOMs
+            function searchInShadowDom(root: Document | ShadowRoot | Element): Element | null {
+                // Try to find in current root
+                const found = root.querySelector(sel);
+                if (found) return found;
+
+                // Search all shadow roots
+                const allElements = root.querySelectorAll('*');
+                for (const el of allElements) {
+                    if (el.shadowRoot) {
+                        const shadowResult = searchInShadowDom(el.shadowRoot);
+                        if (shadowResult) return shadowResult;
+                    }
+                }
+                return null;
+            }
+
+            element = searchInShadowDom(document);
+            return element !== null;
+        }, selector);
+    }
+
+    // Helper function to click element in Shadow DOM
+    async function clickElementWithShadowDom(selector: string): Promise<void> {
+        await context.page.evaluate((sel) => {
+            function findElement(root: Document | ShadowRoot | Element): Element | null {
+                const found = root.querySelector(sel);
+                if (found) return found;
+
+                const allElements = root.querySelectorAll('*');
+                for (const el of allElements) {
+                    if (el.shadowRoot) {
+                        const shadowResult = findElement(el.shadowRoot);
+                        if (shadowResult) return shadowResult;
+                    }
+                }
+                return null;
+            }
+
+            const element = findElement(document) as HTMLElement;
+            if (element) {
+                element.click();
+            } else {
+                throw new Error(`Element not found: ${sel}`);
+            }
+        }, selector);
+    }
+
+    // Helper function to type into element in Shadow DOM
+    async function typeIntoElementWithShadowDom(selector: string, text: string): Promise<void> {
+        await context.page.evaluate((sel) => {
+            function findElement(root: Document | ShadowRoot | Element): Element | null {
+                const found = root.querySelector(sel);
+                if (found) return found;
+
+                const allElements = root.querySelectorAll('*');
+                for (const el of allElements) {
+                    if (el.shadowRoot) {
+                        const shadowResult = findElement(el.shadowRoot);
+                        if (shadowResult) return shadowResult;
+                    }
+                }
+                return null;
+            }
+
+            const element = findElement(document) as HTMLElement;
+            if (element) {
+                element.focus();
+            } else {
+                throw new Error(`Element not found: ${sel}`);
+            }
+        }, selector);
+        
+        // Type using keyboard after focusing
+        await context.page.keyboard.type(text, { delay: 100 });
+    }
+
     const element_type = tool(
         async (input) => {
             const startTime = Date.now();
             await removeHighlight(context);
-            await context.page.waitForSelector(input.selector, { visible: true });
-            await highlight(context, input.selector);
-            await context.page.click(input.selector);
-            await context.page.type(input.selector, input.text, { delay: 100 });
+            
+            // Try regular selector first, fallback to shadow DOM search
+            try {
+                await context.page.waitForSelector(input.selector, { visible: true, timeout: 2000 });
+                await highlight(context, input.selector);
+                await context.page.click(input.selector);
+                await context.page.type(input.selector, input.text, { delay: 100 });
+            } catch {
+                // Element might be in Shadow DOM
+                const found = await findElementWithShadowDom(input.selector);
+                if (!found) {
+                    throw new Error(`Element not found: ${input.selector}`);
+                }
+                await highlight(context, input.selector);
+                await typeIntoElementWithShadowDom(input.selector, input.text);
+            }
+            
             const duration = Date.now() - startTime;
             logger.log(`[TOOL] element_type | Duration: ${duration}ms | Selector: ${input.selector}`);
             return `Typed text into element with selector ${input.selector}`;
         },
         {
             name: "element_type",
-            description: "Type text into an element specified by a CSS selector. Input should be a JSON object with 'selector' and 'text' fields.",
+            description: "Type text into an element specified by a CSS selector. Input should be a JSON object with 'selector' and 'text' fields. Supports elements inside Shadow DOM.",
             schema: z.object({
                 selector: z.string().describe("The CSS selector of the element to type into."),
                 text: z.string().describe("The text to type into the element."),
@@ -58,16 +155,29 @@ export function createNavigatorTools(context: BrowserContext) {
         async (input) => {
             const startTime = Date.now();
             await removeHighlight(context);
-            await context.page.waitForSelector(input.selector, { visible: true });
-            await highlight(context, input.selector);
-            await context.page.click(input.selector);
+            
+            // Try regular selector first, fallback to shadow DOM search
+            try {
+                await context.page.waitForSelector(input.selector, { visible: true, timeout: 2000 });
+                await highlight(context, input.selector);
+                await context.page.click(input.selector);
+            } catch {
+                // Element might be in Shadow DOM
+                const found = await findElementWithShadowDom(input.selector);
+                if (!found) {
+                    throw new Error(`Element not found: ${input.selector}`);
+                }
+                await highlight(context, input.selector);
+                await clickElementWithShadowDom(input.selector);
+            }
+            
             const duration = Date.now() - startTime;
             logger.log(`[TOOL] element_click | Duration: ${duration}ms | Selector: ${input.selector}`);
             return `Clicked element with selector ${input.selector}`;
         },
         {
             name: "element_click",
-            description: "Click an element specified by a CSS selector. Input should be a JSON object with a 'selector' field.",
+            description: "Click an element specified by a CSS selector. Input should be a JSON object with a 'selector' field. Supports elements inside Shadow DOM.",
             schema: z.object({
                 selector: z.string().describe("The CSS selector of the element to click."),
             }),
@@ -140,6 +250,9 @@ export function createNavigatorTools(context: BrowserContext) {
                     '[role="button"]',
                     '[role="link"]',
                     '[role="menuitem"]',
+                    '[role="tab"]',
+                    '[role="option"]',
+                    '[role="listbox"]',
                     '[onclick]',
                     '[tabindex]',
                 ];
@@ -155,13 +268,11 @@ export function createNavigatorTools(context: BrowserContext) {
                     value?: string;
                     selector: string;
                     parentId?: number;
+                    inShadowDom?: boolean;
                 }> = [];
 
-                const allElements = document.querySelectorAll(interactiveSelectors.join(', '));
-                const elementsList = Array.from(allElements);
-                const elementIndexMap = new Map<Element, number>();
-
-                elementsList.forEach((el) => {
+                // Helper function to check if element is visible and interactive
+                function isElementVisibleAndInteractive(el: Element): boolean {
                     const htmlEl = el as HTMLElement;
                     const rect = htmlEl.getBoundingClientRect();
                     const style = window.getComputedStyle(htmlEl);
@@ -176,78 +287,126 @@ export function createNavigatorTools(context: BrowserContext) {
                     const isClickable = style.cursor === 'pointer' || 
                         ['A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'LABEL'].includes(htmlEl.tagName);
 
-                    if (isVisible && isClickable) {
-                        const getUniqueSelector = (element: HTMLElement): string => {
-                            
-                            if (element.id) {
-                                const idSelector = `#${CSS.escape(element.id)}`;
-                                if (document.querySelectorAll(idSelector).length === 1) {
-                                    return idSelector;
-                                }
-                            }
+                    return isVisible && isClickable;
+                }
 
-                            const path: string[] = [];
-                            let current: HTMLElement | null = element;
+                // Function to recursively collect VISIBLE and INTERACTIVE elements from shadow DOMs
+                function collectElements(root: Document | ShadowRoot | Element, shadowPath: string[] = []): Element[] {
+                    const elements: Element[] = [];
+                    const selector = interactiveSelectors.join(', ');
+                    
+                    // Get elements from current root - only add if visible and interactive
+                    const found = root.querySelectorAll(selector);
+                    found.forEach(el => {
+                        if (isElementVisibleAndInteractive(el)) {
+                            (el as any).__shadowPath = shadowPath;
+                            elements.push(el);
+                        }
+                    });
+                    
+                    // Find all elements with shadow roots and recurse
+                    const allElements = root.querySelectorAll('*');
+                    allElements.forEach((el, index) => {
+                        if (el.shadowRoot) {
+                            const newPath = [...shadowPath, `[${index}]`];
+                            elements.push(...collectElements(el.shadowRoot, newPath));
+                        }
+                    });
+                    
+                    return elements;
+                }
 
-                            while (current && current !== document.body) {
-                                let selector = current.tagName.toLowerCase();
+                const allElements = collectElements(document);
+                const elementsList = Array.from(allElements);
+                const elementIndexMap = new Map<Element, number>();
 
-                                if (current.id) {
-                                    selector = `#${CSS.escape(current.id)}`;
-                                    path.unshift(selector);
-                                    break;
-                                }
+                elementsList.forEach((el) => {
+                    const htmlEl = el as HTMLElement;
+                    const shadowPath = (el as any).__shadowPath || [];
+                    const inShadowDom = shadowPath.length > 0;
 
-                                const parent = current.parentElement;
-                                if (parent) {
-                                    const siblings = Array.from(parent.children).filter(
-                                        (child: Element) => child.tagName === current!.tagName
-                                    );
-                                    if (siblings.length > 1) {
-                                        const index = siblings.indexOf(current) + 1;
-                                        selector += `:nth-of-type(${index})`;
+                    const getUniqueSelector = (element: HTMLElement, inShadow: boolean): string => {
+                        // For shadow DOM elements, try to build a path that can be used with pierce selectors
+                        if (element.id) {
+                            const idSelector = `#${CSS.escape(element.id)}`;
+                            // In shadow DOM, we can't check document-wide uniqueness
+                            if (!inShadow) {
+                                try {
+                                    if (document.querySelectorAll(idSelector).length === 1) {
+                                        return idSelector;
                                     }
+                                } catch (e) {
+                                    // Ignore errors from invalid selectors
                                 }
-
-                                path.unshift(selector);
-                                current = parent;
+                            } else {
+                                return idSelector;
                             }
-
-                            return path.join(' > ');
-                        };
-
-                        const selector = getUniqueSelector(htmlEl);
-
-                        const text = htmlEl.innerText?.trim().substring(0, 100) || 
-                                     htmlEl.getAttribute('aria-label') || 
-                                     htmlEl.getAttribute('title') || '';
-
-                        let parentId: number | undefined;
-                        let parent = htmlEl.parentElement;
-                        while (parent) {
-                            if (elementIndexMap.has(parent)) {
-                                parentId = elementIndexMap.get(parent);
-                                break;
-                            }
-                            parent = parent.parentElement;
                         }
 
-                        const currentIndex = results.length;
-                        elementIndexMap.set(el, currentIndex);
+                        const path: string[] = [];
+                        let current: HTMLElement | null = element;
 
-                        results.push({
-                            tag: htmlEl.tagName.toLowerCase(),
-                            type: htmlEl.getAttribute('type') || undefined,
-                            text: text,
-                            href: htmlEl.getAttribute('href') || undefined,
-                            name: htmlEl.getAttribute('name') || undefined,
-                            id: htmlEl.id || undefined,
-                            placeholder: htmlEl.getAttribute('placeholder') || undefined,
-                            value: (htmlEl as HTMLInputElement).value || undefined,
-                            selector: selector,
-                            parentId: parentId,
-                        });
+                        while (current && current !== document.body && !(current.parentNode instanceof ShadowRoot)) {
+                            let selector = current.tagName.toLowerCase();
+
+                            if (current.id) {
+                                selector = `#${CSS.escape(current.id)}`;
+                                path.unshift(selector);
+                                break;
+                            }
+
+                            const parent = current.parentElement;
+                            if (parent) {
+                                const siblings = Array.from(parent.children).filter(
+                                    (child: Element) => child.tagName === current!.tagName
+                                );
+                                if (siblings.length > 1) {
+                                    const index = siblings.indexOf(current) + 1;
+                                    selector += `:nth-of-type(${index})`;
+                                }
+                            }
+
+                            path.unshift(selector);
+                            current = parent;
+                        }
+
+                        return path.join(' > ');
+                    };
+
+                    const selector = getUniqueSelector(htmlEl, inShadowDom);
+
+                    const text = htmlEl.innerText?.trim().substring(0, 100) || 
+                                 htmlEl.getAttribute('aria-label') || 
+                                 htmlEl.getAttribute('title') || 
+                                 htmlEl.getAttribute('data-label') ||
+                                 '';
+
+                    let parentId: number | undefined;
+                    let parent = htmlEl.parentElement;
+                    while (parent) {
+                        if (elementIndexMap.has(parent)) {
+                            parentId = elementIndexMap.get(parent);
+                            break;
+                        }
+                        parent = parent.parentElement;
                     }
+
+                    const currentIndex = results.length;
+                    elementIndexMap.set(el, currentIndex);
+
+                    results.push({
+                        tag: htmlEl.tagName.toLowerCase(),
+                        type: htmlEl.getAttribute('type') || undefined,
+                        text: text,
+                        href: htmlEl.getAttribute('href') || undefined,
+                        name: htmlEl.getAttribute('name') || undefined,
+                        id: htmlEl.id || undefined,
+                        placeholder: htmlEl.getAttribute('placeholder') || undefined,
+                        value: (htmlEl as HTMLInputElement).value || undefined,
+                        selector: selector,
+                        parentId: parentId,
+                        inShadowDom: inShadowDom || undefined,
+                    });
                 });
 
                 return results;
@@ -263,14 +422,16 @@ export function createNavigatorTools(context: BrowserContext) {
                 desc += `>`;
                 if (el.text) desc += ` "${el.text.substring(0, 50)}"`;
                 desc += ` [selector: ${el.selector}]`;
+                if (el.inShadowDom) desc += ` [shadow-dom]`;
                 if (el.parentId !== undefined) desc += ` [parent: ${el.parentId}]`;
                 return desc;
             }).join('\n');
 
-            const result = `Found ${elements.length} interactive elements:\n${formatted}`;
+            const shadowCount = elements.filter(e => e.inShadowDom).length;
+            const result = `Found ${elements.length} interactive elements (${shadowCount} in Shadow DOM):\n${formatted}`;
             const duration = Date.now() - startTime;
             
-            logger.log(`[TOOL] get_page_content | Duration: ${duration}ms | Elements: ${elements.length}`);
+            logger.log(`[TOOL] get_page_content | Duration: ${duration}ms | Elements: ${elements.length} | Shadow DOM: ${shadowCount}`);
             
             return result;
         },
