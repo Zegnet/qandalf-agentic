@@ -1,11 +1,12 @@
 import { createAgent, initChatModel, ReactAgent, toolStrategy } from "langchain";
 import { BrowserInstance } from "./browser";
 import { createNavigatorTools } from "./browserContext";
-import { Logger } from "@nestjs/common";
+import { Inject, Injectable, Logger } from "@nestjs/common";
 import * as z from "zod";
 import { Browser, Page } from "puppeteer";
 import { Agent } from "src/core/interfaces/agent";
-import { AzureChatOpenAI, AzureOpenAI } from "@langchain/openai";
+import { AzureChatOpenAI, AzureOpenAI, ChatOpenAI } from "@langchain/openai";
+import { ModelFactory } from "src/models/model.factory";
 
 const navigationResponseSchema = z.object({
     action: z.string().describe("The action executed by the agent."),
@@ -15,15 +16,10 @@ const navigationResponseSchema = z.object({
 
 type NavigationResponse = z.infer<typeof navigationResponseSchema>;        
 
+@Injectable()
 export class AgentNavigator implements Agent{
     private agent: ReactAgent | undefined;
     private browserInstance: {browser: Browser; page: Page } | undefined;
-    
-    public static async Instance(): Promise<AgentNavigator> {
-        const navigator = new AgentNavigator();
-        await navigator.create();
-        return navigator;
-    }
 
     async invoke(input: { messages: { role: string; content: string; }[]; }): Promise<{ structuredResponse?: any; }> {
         if (!this.agent) {
@@ -63,12 +59,24 @@ export class AgentNavigator implements Agent{
             logger: new Logger('NavigatorAgent'),
         });
 
-        const model = new AzureChatOpenAI({
-            azureOpenAIApiKey: process.env.AZURE_OPENAI_API_KEY,
-            azureOpenAIEndpoint: process.env.AZURE_OPENAI_ENDPOINT,
-            azureOpenAIApiDeploymentName: process.env.AZURE_OPENAI_DEPLOYMENT_NAME,
-            azureOpenAIApiVersion: process.env.AZURE_OPENAI_API_VERSION,
-        });
+        let model;
+
+        if(!process.env.AZURE_OPENAI_API_KEY) {
+
+            model = new ChatOpenAI({
+                model: process.env.OPENAI_MODEL || 'gpt-4-turbo',
+            });
+
+        }else{
+
+            model = new AzureChatOpenAI({
+                azureOpenAIApiKey: process.env.AZURE_OPENAI_API_KEY,
+                azureOpenAIEndpoint: process.env.AZURE_OPENAI_ENDPOINT,
+                azureOpenAIApiDeploymentName: process.env.AZURE_OPENAI_DEPLOYMENT_NAME,
+                azureOpenAIApiVersion: process.env.AZURE_OPENAI_API_VERSION,
+            });
+        }
+
 
         this.agent = createAgent({
             model,

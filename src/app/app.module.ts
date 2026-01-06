@@ -3,6 +3,8 @@ import { ConfigModule } from '@nestjs/config';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { SseModule } from '../sse/sse.module';
+import { ModelModule } from 'src/models/model.module';
+import { AgentNavigator } from 'src/core/agents/navigator/agent-navigator';
 
 @Module({
   imports: [ 
@@ -12,8 +14,9 @@ import { SseModule } from '../sse/sse.module';
       isGlobal: true,
     }),
     SseModule,
+    ModelModule
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [AppService, AgentNavigator],
 })
 export class AppModule {}

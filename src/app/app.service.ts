@@ -6,7 +6,10 @@ import { SseService } from 'src/sse/sse.service';
 export class AppService {
   private readonly logger = new Logger('NavigatorAgent');
 
-  constructor(private sseService: SseService) {}
+  constructor(
+    private sseService: SseService,
+    private navigator: AgentNavigator
+  ) {}
   
   async execute(uuid: string, task: string): Promise<void> {
 
@@ -21,8 +24,8 @@ export class AppService {
       }
 
       if(!session.agent) {
-        const navigator = await AgentNavigator.Instance();
-        session.agent = navigator;
+        await this.navigator.create();
+        session.agent = this.navigator;
       }
 
       const response = await session.agent.invoke({
