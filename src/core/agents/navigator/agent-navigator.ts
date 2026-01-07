@@ -77,7 +77,7 @@ export class AgentNavigator implements Agent{
             - Use the EXACT selector from [selector: ...]
             - When instruction says "aguardo carregamento", call wait_for_page_load
             - If similar elements exist, prefer performing actions in elements like buttons, links, inputs, selects rather than child elements (spans, divs, etc)
-            
+
             FINDING ELEMENTS:
             1. Call get_page_content to see available elements
             2. If target element NOT found, call get_more_elements to load more content
@@ -87,8 +87,7 @@ export class AgentNavigator implements Agent{
             EXECUTING ACTION:
             1. Find element with EXACT matching text
             2. If found and certain, call action tool (element_click/element_type/element_select_option)
-            3. If instruction mentions "aguardo", call wait_for_page_load
-            4. Next instruction`,
+            3. If instruction mentions "aguardo" or similiar, call wait_for_page_load`,
 
             tools: Object.values(tools),
 

@@ -2,6 +2,7 @@ import { Logger } from "@nestjs/common";
 import { tool } from "langchain";
 import { Browser, Frame, KeyInput, Page } from "puppeteer";
 import * as z from "zod";
+import { generatePdf, cleanupOldFiles } from "../../../utils/pdf-generator";
 
 export interface BrowserContext {
     browser: Browser;
@@ -409,6 +410,7 @@ export function createNavigatorTools(context: BrowserContext) {
                     'select',
                     'textarea',
                     'label',
+                    'img',
                     'iframe',
                     'frame',
                     'frameset',
@@ -430,6 +432,7 @@ export function createNavigatorTools(context: BrowserContext) {
                     name?: string;
                     id?: string;
                     ariaLabel?: string;
+                    alt?: string;
                     placeholder?: string;
                     value?: string;
                     src?: string;
@@ -494,6 +497,9 @@ export function createNavigatorTools(context: BrowserContext) {
                     
                     // Frames are always interactive
                     if (['IFRAME', 'FRAME', 'FRAMESET'].includes(htmlEl.tagName)) return true;
+                    
+                    // Images are always included for accessibility inspection
+                    if (htmlEl.tagName === 'IMG') return true;
                     
                     // Interactive by cursor
                     if (style.cursor === 'pointer') return true;
@@ -697,6 +703,7 @@ export function createNavigatorTools(context: BrowserContext) {
                     // Get text from element itself or from nearby elements for inputs/labels without text
                     let text = htmlEl.innerText?.trim().substring(0, 100) || 
                                htmlEl.getAttribute('aria-label') || 
+                               htmlEl.getAttribute('alt') || 
                                htmlEl.getAttribute('title') || 
                                htmlEl.getAttribute('data-label') ||
                                '';
@@ -792,6 +799,7 @@ export function createNavigatorTools(context: BrowserContext) {
                         name: htmlEl.getAttribute('name') || undefined,
                         id: htmlEl.id || undefined,
                         ariaLabel: htmlEl.getAttribute('aria-label') || undefined,
+                        alt: htmlEl.getAttribute('alt') || undefined,
                         placeholder: htmlEl.getAttribute('placeholder') || undefined,
                         value: (htmlEl as HTMLInputElement).value || undefined,
                         src: htmlEl.getAttribute('src') || undefined,
@@ -811,6 +819,7 @@ export function createNavigatorTools(context: BrowserContext) {
                 if (el.id) desc += ` id="${el.id}"`;
                 if (el.name) desc += ` name="${el.name}"`;
                 if (el.ariaLabel) desc += ` aria-label="${el.ariaLabel.substring(0, 50)}"`;
+                if (el.alt) desc += ` alt="${el.alt.substring(0, 50)}"`;
                 if (el.src) desc += ` src="${el.src.substring(0, 50)}"`;
                 if (el.href) desc += ` href="${el.href.substring(0, 50)}"`;
                 if (el.placeholder) desc += ` placeholder="${el.placeholder}"`;
@@ -1006,6 +1015,384 @@ export function createNavigatorTools(context: BrowserContext) {
         }
     );
 
+    const upload_file = tool(
+        async (input) => {
+            const startTime = Date.now();
+            
+            const targetContext = context.currentFrame || context.page;
+            
+            const fileExists = await targetContext.evaluate((sel) => {
+                function findElement(root: Document | ShadowRoot | Element): Element | null {
+                    const found = root.querySelector(sel);
+                    if (found) return found;
+
+                    const allElements = root.querySelectorAll('*');
+                    for (const el of allElements) {
+                        if (el.shadowRoot) {
+                            const shadowResult = findElement(el.shadowRoot);
+                            if (shadowResult) return shadowResult;
+                        }
+                    }
+                    return null;
+                }
+                
+                const element = findElement(document);
+                return element !== null && element.tagName === 'INPUT' && (element as HTMLInputElement).type === 'file';
+            }, input.selector);
+            
+            if (!fileExists) {
+                const duration = Date.now() - startTime;
+                logger.error(`[TOOL] upload_file | Duration: ${duration}ms | File input not found: ${input.selector}`);
+                return `Error: File input not found with selector: ${input.selector}`;
+            }
+
+            try {
+                const fileInput = await targetContext.$(input.selector);
+                if (fileInput) {
+                    const tagName = await fileInput.evaluate((el: Element) => el.tagName);
+                    if (tagName === 'INPUT') {
+                        await (fileInput as any).uploadFile(input.filePath);
+                        await fileInput.evaluate((el: Element) => {
+                            const event = new Event('change', { bubbles: true });
+                            el.dispatchEvent(event);
+                        });
+                    }
+                } else {
+                    await targetContext.evaluate((sel, path) => {
+                        function findElement(root: Document | ShadowRoot | Element): HTMLInputElement | null {
+                            const found = root.querySelector(sel) as HTMLInputElement;
+                            if (found && found.tagName === 'INPUT' && found.type === 'file') return found;
+
+                            const allElements = root.querySelectorAll('*');
+                            for (const el of allElements) {
+                                if (el.shadowRoot) {
+                                    const shadowResult = findElement(el.shadowRoot);
+                                    if (shadowResult) return shadowResult;
+                                }
+                            }
+                            return null;
+                        }
+                        
+                        const element = findElement(document);
+                        if (!element) {
+                            throw new Error(`File input not found: ${sel}`);
+                        }
+                        
+                        const event = new Event('input', { bubbles: true });
+                        element.dispatchEvent(event);
+                        const changeEvent = new Event('change', { bubbles: true });
+                        element.dispatchEvent(changeEvent);
+                    }, input.selector, input.filePath);
+                }
+            } catch (error) {
+                const duration = Date.now() - startTime;
+                logger.error(`[TOOL] upload_file | Duration: ${duration}ms | Failed to upload file: ${error}`);
+                return `Error: Failed to upload file - ${error}`;
+            }
+            
+            const duration = Date.now() - startTime;
+            logger.log(`[TOOL] upload_file | Duration: ${duration}ms | Selector: ${input.selector} | File: ${input.filePath}`);
+            return `Uploaded file ${input.filePath} to element ${input.selector}`;
+        },
+        {
+            name: "upload_file",
+            description: "Upload a file to a file input element. Supports elements inside Shadow DOM. Use this after generating a PDF or when you need to attach files.",
+            schema: z.object({
+                selector: z.string().describe("The CSS selector of the file input element (input[type='file'])."),
+                filePath: z.string().describe("The absolute path to the file to upload."),
+            }),
+        }
+    );
+
+    const generate_dummy_pdf = tool(
+        async (input) => {
+            const startTime = Date.now();
+            
+            try {
+                const tempDir = input.outputDir || undefined;
+                if (tempDir) {
+                    cleanupOldFiles(tempDir, 24);
+                }
+                
+                const filePath = await generatePdf({
+                    fileName: input.fileName,
+                    content: input.content,
+                    outputDir: tempDir,
+                });
+                
+                const duration = Date.now() - startTime;
+                logger.log(`[TOOL] generate_dummy_pdf | Duration: ${duration}ms | File: ${filePath}`);
+                return `Generated PDF at: ${filePath}`;
+            } catch (error) {
+                const duration = Date.now() - startTime;
+                logger.error(`[TOOL] generate_dummy_pdf | Duration: ${duration}ms | Failed to generate PDF: ${error}`);
+                return `Error: Failed to generate PDF - ${error}`;
+            }
+        },
+        {
+            name: "generate_dummy_pdf",
+            description: "Generate a dummy PDF file for testing purposes. Use this before uploading files when you need to attach a PDF document.",
+            schema: z.object({
+                fileName: z.string().optional().describe("The name of the PDF file. If not provided, a timestamp-based name will be used."),
+                content: z.string().optional().describe("The text content to include in the PDF. If not provided, default test content will be used."),
+                outputDir: z.string().optional().describe("The directory where the PDF will be saved. If not provided, defaults to 'temp/uploads' in the project directory."),
+            }),
+        }
+    );
+
+    const inspect_accessibility = tool(
+        async (input) => {
+            const startTime = Date.now();
+            
+            // Use frame context if set, otherwise use main page
+            const targetContext = context.currentFrame || context.page;
+            const frameInfo = context.currentFrame 
+                ? `frame: "${context.currentFrame.name() || context.currentFrame.url()}"` 
+                : 'main page';
+            
+            const accessibilityReport = await targetContext.evaluate((elementType) => {
+                const results: Array<{
+                    tag: string;
+                    selector: string;
+                    alt?: string;
+                    ariaLabel?: string;
+                    role?: string;
+                    title?: string;
+                    src?: string;
+                    tabindex?: string;
+                    hasAltIssue?: boolean;
+                    issue?: string;
+                    inShadowDom?: boolean;
+                }> = [];
+
+                function collectAccessibilityElements(root: Document | ShadowRoot | Element, shadowPath: string[] = []): void {
+                    const inShadowDom = shadowPath.length > 0;
+                    let selector = '';
+                    
+                    // Select elements based on type
+                    if (elementType === 'images' || elementType === 'all') {
+                        const images = root.querySelectorAll('img');
+                        images.forEach((img, index) => {
+                            const htmlImg = img as HTMLImageElement;
+                            const alt = htmlImg.getAttribute('alt');
+                            const role = htmlImg.getAttribute('role');
+                            const ariaLabel = htmlImg.getAttribute('aria-label');
+                            
+                            // Build selector
+                            if (htmlImg.id) {
+                                selector = `#${CSS.escape(htmlImg.id)}`;
+                            } else if (htmlImg.src) {
+                                selector = `img[src="${htmlImg.src.substring(0, 50)}"]`;
+                            } else {
+                                selector = `img:nth-of-type(${index + 1})`;
+                            }
+                            
+                            // Check for accessibility issues
+                            let hasAltIssue = false;
+                            let issue = '';
+                            
+                            // Decorative images should have empty alt or role="presentation"
+                            const isDecorative = role === 'presentation' || role === 'none' || alt === '';
+                            
+                            if (alt === null) {
+                                hasAltIssue = true;
+                                issue = 'Missing alt attribute';
+                            } else if (!isDecorative && alt.trim().length === 0) {
+                                hasAltIssue = true;
+                                issue = 'Empty alt on informative image';
+                            } else if (alt && alt.length > 150) {
+                                hasAltIssue = true;
+                                issue = 'Alt text too long (>150 chars)';
+                            }
+                            
+                            results.push({
+                                tag: 'img',
+                                selector: selector,
+                                alt: alt || undefined,
+                                ariaLabel: ariaLabel || undefined,
+                                role: role || undefined,
+                                title: htmlImg.getAttribute('title') || undefined,
+                                src: htmlImg.src?.substring(0, 100) || undefined,
+                                hasAltIssue: hasAltIssue,
+                                issue: issue || undefined,
+                                inShadowDom: inShadowDom || undefined,
+                            });
+                        });
+                    }
+                    
+                    if (elementType === 'buttons' || elementType === 'all') {
+                        const buttons = root.querySelectorAll('button, [role="button"]');
+                        buttons.forEach((btn, index) => {
+                            const htmlBtn = btn as HTMLElement;
+                            const ariaLabel = htmlBtn.getAttribute('aria-label');
+                            const innerText = htmlBtn.innerText?.trim();
+                            const role = htmlBtn.getAttribute('role');
+                            
+                            if (htmlBtn.id) {
+                                selector = `#${CSS.escape(htmlBtn.id)}`;
+                            } else {
+                                selector = `button:nth-of-type(${index + 1})`;
+                            }
+                            
+                            let hasAltIssue = false;
+                            let issue = '';
+                            
+                            if (!ariaLabel && !innerText) {
+                                hasAltIssue = true;
+                                issue = 'Button has no accessible name (no aria-label or text content)';
+                            }
+                            
+                            results.push({
+                                tag: htmlBtn.tagName.toLowerCase(),
+                                selector: selector,
+                                ariaLabel: ariaLabel || undefined,
+                                role: role || undefined,
+                                hasAltIssue: hasAltIssue,
+                                issue: issue || undefined,
+                                inShadowDom: inShadowDom || undefined,
+                            });
+                        });
+                    }
+                    
+                    if (elementType === 'links' || elementType === 'all') {
+                        const links = root.querySelectorAll('a');
+                        links.forEach((link, index) => {
+                            const htmlLink = link as HTMLAnchorElement;
+                            const ariaLabel = htmlLink.getAttribute('aria-label');
+                            const innerText = htmlLink.innerText?.trim();
+                            const title = htmlLink.getAttribute('title');
+                            
+                            if (htmlLink.id) {
+                                selector = `#${CSS.escape(htmlLink.id)}`;
+                            } else {
+                                selector = `a:nth-of-type(${index + 1})`;
+                            }
+                            
+                            let hasAltIssue = false;
+                            let issue = '';
+                            
+                            if (!ariaLabel && !innerText && !title) {
+                                hasAltIssue = true;
+                                issue = 'Link has no accessible name';
+                            }
+                            
+                            results.push({
+                                tag: 'a',
+                                selector: selector,
+                                ariaLabel: ariaLabel || undefined,
+                                title: title || undefined,
+                                hasAltIssue: hasAltIssue,
+                                issue: issue || undefined,
+                                inShadowDom: inShadowDom || undefined,
+                            });
+                        });
+                    }
+                    
+                    if (elementType === 'inputs' || elementType === 'all') {
+                        const inputs = root.querySelectorAll('input:not([type="hidden"]), select, textarea');
+                        inputs.forEach((input, index) => {
+                            const htmlInput = input as HTMLInputElement;
+                            const ariaLabel = htmlInput.getAttribute('aria-label');
+                            const placeholder = htmlInput.getAttribute('placeholder');
+                            const id = htmlInput.id;
+                            let hasAssociatedLabel = false;
+                            
+                            if (id) {
+                                const label = (root as Document).querySelector(`label[for="${id}"]`);
+                                hasAssociatedLabel = label !== null;
+                            }
+                            
+                            if (htmlInput.id) {
+                                selector = `#${CSS.escape(htmlInput.id)}`;
+                            } else {
+                                selector = `${htmlInput.tagName.toLowerCase()}:nth-of-type(${index + 1})`;
+                            }
+                            
+                            let hasAltIssue = false;
+                            let issue = '';
+                            
+                            if (!ariaLabel && !hasAssociatedLabel && !placeholder) {
+                                hasAltIssue = true;
+                                issue = 'Input has no accessible label';
+                            }
+                            
+                            results.push({
+                                tag: htmlInput.tagName.toLowerCase(),
+                                selector: selector,
+                                ariaLabel: ariaLabel || undefined,
+                                tabindex: htmlInput.getAttribute('tabindex') || undefined,
+                                hasAltIssue: hasAltIssue,
+                                issue: issue || undefined,
+                                inShadowDom: inShadowDom || undefined,
+                            });
+                        });
+                    }
+                    
+                    // Recurse into shadow DOMs
+                    const allElements = root.querySelectorAll('*');
+                    allElements.forEach((el, index) => {
+                        if (el.shadowRoot) {
+                            collectAccessibilityElements(el.shadowRoot, [...shadowPath, `[${index}]`]);
+                        }
+                    });
+                }
+                
+                collectAccessibilityElements(document);
+                return results;
+            }, input.elementType || 'all');
+            
+            const duration = Date.now() - startTime;
+            
+            // Format report
+            const totalElements = accessibilityReport.length;
+            const elementsWithIssues = accessibilityReport.filter(e => e.hasAltIssue).length;
+            const shadowDomElements = accessibilityReport.filter(e => e.inShadowDom).length;
+            
+            let report = `Accessibility Inspection Report (Context: ${frameInfo})\n`;
+            report += `Total elements: ${totalElements} | Issues found: ${elementsWithIssues} | Shadow DOM: ${shadowDomElements}\n\n`;
+            
+            if (elementsWithIssues > 0) {
+                report += `ELEMENTS WITH ISSUES:\n`;
+                accessibilityReport.filter(e => e.hasAltIssue).forEach((el, i) => {
+                    report += `[${i}] <${el.tag}`;
+                    if (el.ariaLabel) report += ` aria-label="${el.ariaLabel.substring(0, 50)}"`;
+                    if (el.alt !== undefined) report += ` alt="${el.alt || '(empty)'}"`; 
+                    if (el.role) report += ` role="${el.role}"`;
+                    if (el.src) report += ` src="${el.src.substring(0, 50)}"`;
+                    report += `> [selector: ${el.selector}]`;
+                    if (el.inShadowDom) report += ` [shadow-dom]`;
+                    report += `\n   ⚠️ ISSUE: ${el.issue}\n`;
+                });
+                report += `\n`;
+            }
+            
+            report += `ALL ELEMENTS:\n`;
+            accessibilityReport.forEach((el, i) => {
+                const status = el.hasAltIssue ? '🔴' : '✅';
+                report += `${status} [${i}] <${el.tag}`;
+                if (el.ariaLabel) report += ` aria-label="${el.ariaLabel.substring(0, 50)}"`;
+                if (el.alt !== undefined) report += ` alt="${el.alt || '(empty)'}"`;
+                if (el.role) report += ` role="${el.role}"`;
+                if (el.src) report += ` src="${el.src.substring(0, 50)}"`;
+                if (el.title) report += ` title="${el.title.substring(0, 50)}"`;
+                report += `> [selector: ${el.selector}]`;
+                if (el.inShadowDom) report += ` [shadow-dom]`;
+                report += `\n`;
+            });
+            
+            logger.log(`[TOOL] inspect_accessibility | Duration: ${duration}ms | Elements: ${totalElements} | Issues: ${elementsWithIssues}`);
+            
+            return report;
+        },
+        {
+            name: "inspect_accessibility",
+            description: "Inspect page elements for accessibility issues. Checks images for alt attributes, buttons for accessible names, links for text, and inputs for labels. Use this to audit accessibility compliance or find elements with missing alt text.",
+            schema: z.object({
+                elementType: z.enum(['images', 'buttons', 'links', 'inputs', 'all']).optional().describe("Type of elements to inspect. Default is 'all'. Use 'images' to check only images for alt attributes."),
+            }),
+        }
+    );
+
     return {
         navigate_to,
         get_page_content,
@@ -1018,5 +1405,8 @@ export function createNavigatorTools(context: BrowserContext) {
         element_select_option,
         press_keyboard_key,
         switch_to_frame,
+        inspect_accessibility,
+        upload_file,
+        generate_dummy_pdf,
     };
 }
