@@ -432,6 +432,7 @@ export function createNavigatorTools(context: BrowserContext) {
                     name?: string;
                     id?: string;
                     ariaLabel?: string;
+                    ariaExpanded?: string;
                     alt?: string;
                     placeholder?: string;
                     value?: string;
@@ -440,6 +441,7 @@ export function createNavigatorTools(context: BrowserContext) {
                     parentId?: number;
                     inShadowDom?: boolean;
                     formContext?: string;
+                    options?: Array<{ value: string; text: string; selected: boolean }>;
                 }> = [];
 
                 // Helper function to check if element is visible
@@ -788,6 +790,17 @@ export function createNavigatorTools(context: BrowserContext) {
                     // Get form context - use shadow context if available, otherwise compute it
                     const formContext = shadowContext || getFormContext(el);
 
+                    // Get options for select elements
+                    let options: Array<{ value: string; text: string; selected: boolean }> | undefined;
+                    if (htmlEl.tagName === 'SELECT') {
+                        const selectEl = htmlEl as HTMLSelectElement;
+                        options = Array.from(selectEl.options).map(opt => ({
+                            value: opt.value,
+                            text: opt.text.trim(),
+                            selected: opt.selected,
+                        }));
+                    }
+
                     const currentIndex = results.length;
                     elementIndexMap.set(el, currentIndex);
 
@@ -799,6 +812,7 @@ export function createNavigatorTools(context: BrowserContext) {
                         name: htmlEl.getAttribute('name') || undefined,
                         id: htmlEl.id || undefined,
                         ariaLabel: htmlEl.getAttribute('aria-label') || undefined,
+                        ariaExpanded: htmlEl.getAttribute('aria-expanded') || undefined,
                         alt: htmlEl.getAttribute('alt') || undefined,
                         placeholder: htmlEl.getAttribute('placeholder') || undefined,
                         value: (htmlEl as HTMLInputElement).value || undefined,
@@ -807,6 +821,7 @@ export function createNavigatorTools(context: BrowserContext) {
                         parentId: parentId,
                         inShadowDom: inShadowDom || undefined,
                         formContext: formContext,
+                        options: options,
                     });
                 });
 
@@ -819,6 +834,7 @@ export function createNavigatorTools(context: BrowserContext) {
                 if (el.id) desc += ` id="${el.id}"`;
                 if (el.name) desc += ` name="${el.name}"`;
                 if (el.ariaLabel) desc += ` aria-label="${el.ariaLabel.substring(0, 50)}"`;
+                if (el.ariaExpanded) desc += ` aria-expanded="${el.ariaExpanded}"`;
                 if (el.alt) desc += ` alt="${el.alt.substring(0, 50)}"`;
                 if (el.src) desc += ` src="${el.src.substring(0, 50)}"`;
                 if (el.href) desc += ` href="${el.href.substring(0, 50)}"`;
@@ -826,6 +842,13 @@ export function createNavigatorTools(context: BrowserContext) {
                 desc += `>`;
                 if (el.text) desc += ` "${el.text.substring(0, 50)}"`;
                 desc += ` [selector: ${el.selector}]`;
+                if (el.options && el.options.length > 0) {
+                    const optionsStr = el.options.map(o => {
+                        const selectedMark = o.selected ? '*' : '';
+                        return `${selectedMark}"${o.text}"(${o.value})`;
+                    }).join(', ');
+                    desc += ` [options: ${optionsStr}]`;
+                }
                 if (el.inShadowDom) desc += ` [shadow-dom]`;
                 if (el.formContext) desc += ` [form: ${el.formContext}]`;
                 if (el.parentId !== undefined) desc += ` [parent: ${el.parentId}]`;
@@ -1144,7 +1167,6 @@ export function createNavigatorTools(context: BrowserContext) {
         async (input) => {
             const startTime = Date.now();
             
-            // Use frame context if set, otherwise use main page
             const targetContext = context.currentFrame || context.page;
             const frameInfo = context.currentFrame 
                 ? `frame: "${context.currentFrame.name() || context.currentFrame.url()}"` 
@@ -1169,7 +1191,6 @@ export function createNavigatorTools(context: BrowserContext) {
                     const inShadowDom = shadowPath.length > 0;
                     let selector = '';
                     
-                    // Select elements based on type
                     if (elementType === 'images' || elementType === 'all') {
                         const images = root.querySelectorAll('img');
                         images.forEach((img, index) => {
@@ -1178,7 +1199,6 @@ export function createNavigatorTools(context: BrowserContext) {
                             const role = htmlImg.getAttribute('role');
                             const ariaLabel = htmlImg.getAttribute('aria-label');
                             
-                            // Build selector
                             if (htmlImg.id) {
                                 selector = `#${CSS.escape(htmlImg.id)}`;
                             } else if (htmlImg.src) {
@@ -1187,11 +1207,9 @@ export function createNavigatorTools(context: BrowserContext) {
                                 selector = `img:nth-of-type(${index + 1})`;
                             }
                             
-                            // Check for accessibility issues
                             let hasAltIssue = false;
                             let issue = '';
                             
-                            // Decorative images should have empty alt or role="presentation"
                             const isDecorative = role === 'presentation' || role === 'none' || alt === '';
                             
                             if (alt === null) {
@@ -1328,7 +1346,6 @@ export function createNavigatorTools(context: BrowserContext) {
                         });
                     }
                     
-                    // Recurse into shadow DOMs
                     const allElements = root.querySelectorAll('*');
                     allElements.forEach((el, index) => {
                         if (el.shadowRoot) {
@@ -1343,7 +1360,6 @@ export function createNavigatorTools(context: BrowserContext) {
             
             const duration = Date.now() - startTime;
             
-            // Format report
             const totalElements = accessibilityReport.length;
             const elementsWithIssues = accessibilityReport.filter(e => e.hasAltIssue).length;
             const shadowDomElements = accessibilityReport.filter(e => e.inShadowDom).length;
@@ -1393,6 +1409,67 @@ export function createNavigatorTools(context: BrowserContext) {
         }
     );
 
+    const wait_for_accordion_expand = tool(
+        async (input) => {
+            const startTime = Date.now();
+            const timeout = input.timeout || 10000;
+            const checkInterval = 200;
+
+            logger.log(`[TOOL] wait_for_accordion_expand | Waiting for accordion to expand: ${input.selector}`);
+
+            const targetContext = context.currentFrame || context.page;
+
+            while (Date.now() - startTime < timeout) {
+                const isExpanded = await targetContext.evaluate((sel) => {
+                    function findElement(root: Document | ShadowRoot | Element): Element | null {
+                        const found = root.querySelector(sel);
+                        if (found) return found;
+
+                        const allElements = root.querySelectorAll('*');
+                        for (const el of allElements) {
+                            if (el.shadowRoot) {
+                                const shadowResult = findElement(el.shadowRoot);
+                                if (shadowResult) return shadowResult;
+                            }
+                        }
+                        return null;
+                    }
+
+                    const element = findElement(document) as HTMLElement;
+                    if (!element) return null;
+                    
+                    return element.getAttribute('aria-expanded') === 'true';
+                }, input.selector);
+
+                if (isExpanded === null) {
+                    const duration = Date.now() - startTime;
+                    logger.log(`[TOOL] wait_for_accordion_expand | Duration: ${duration}ms | Element not found: ${input.selector}`);
+                    return `Error: Element not found with selector: ${input.selector}`;
+                }
+
+                if (isExpanded) {
+                    const duration = Date.now() - startTime;
+                    logger.log(`[TOOL] wait_for_accordion_expand | Duration: ${duration}ms | Accordion expanded`);
+                    return `Accordion with selector ${input.selector} is now expanded (aria-expanded="true") after ${duration}ms.`;
+                }
+
+                await new Promise((resolve) => setTimeout(resolve, checkInterval));
+            }
+
+            const duration = Date.now() - startTime;
+            logger.log(`[TOOL] wait_for_accordion_expand | Duration: ${duration}ms | Timeout - accordion not expanded`);
+            return `Timeout after ${timeout}ms. Accordion with selector ${input.selector} did not expand (aria-expanded is not "true").`;
+        },
+        {
+            name: "wait_for_accordion_expand",
+            description: "Wait for an accordion element to expand by monitoring its aria-expanded attribute. Use this after clicking on an accordion trigger button to ensure the content is visible before interacting with it.",
+            schema: z.object({
+                selector: z.string().describe("The CSS selector of the accordion trigger element (the button with aria-expanded attribute)."),
+                timeout: z.number().optional().describe("Maximum time to wait in milliseconds. Default is 10000 (10 seconds)."),
+            }),
+        }
+    );
+
     return {
         navigate_to,
         get_page_content,
@@ -1402,6 +1479,7 @@ export function createNavigatorTools(context: BrowserContext) {
         wait_for_timeout,
         wait_for_page_load,
         wait_for_text,
+        wait_for_accordion_expand,
         element_select_option,
         press_keyboard_key,
         switch_to_frame,
